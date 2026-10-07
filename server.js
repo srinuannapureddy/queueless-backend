@@ -7,669 +7,1724 @@ const rateLimit = require("express-rate-limit");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const twilio = require("twilio");
-const { Pool } = require("pg");
+const sqlite3 = require("sqlite3").verbose();
+const path = require("path");
+const fs = require("fs");
 
 const app = express();
-const PORT = Number(process.env.PORT || 4000);
 
-if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required");
-if (!process.env.JWT_SECRET) throw new Error("JWT_SECRET is required");
-if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN ||
-    !process.env.TWILIO_VERIFY_SERVICE_SID) {
-  throw new Error("Twilio Verify environment variables are required");
+const PORT = process.env.PORT || 4000;
+
+const JWT_SECRET = process.env.JWT_SECRET;
+const FRONTEND_URL =
+  process.env.FRONTEND_URL || "http://localhost:5173";
+
+const TWILIO_ACCOUNT_SID =
+  process.env.TWILIO_ACCOUNT_SID;
+
+const TWILIO_AUTH_TOKEN =
+  process.env.TWILIO_AUTH_TOKEN;
+
+const TWILIO_VERIFY_SERVICE_SID =
+  process.env.TWILIO_VERIFY_SERVICE_SID;
+
+/* =====================================================
+   REQUIRED ENVIRONMENT VARIABLES
+===================================================== */
+
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET is required");
 }
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false
-});
+if (!TWILIO_ACCOUNT_SID) {
+  throw new Error("TWILIO_ACCOUNT_SID is required");
+}
+
+if (!TWILIO_AUTH_TOKEN) {
+  throw new Error("TWILIO_AUTH_TOKEN is required");
+}
+
+if (!TWILIO_VERIFY_SERVICE_SID) {
+  throw new Error("TWILIO_VERIFY_SERVICE_SID is required");
+}
+
+/* =====================================================
+   TWILIO
+===================================================== */
 
 const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN
 );
 
-app.use(helmet());
-app.use(cors({
-  origin: process.env.FRONTEND_URL
-    ? process.env.FRONTEND_URL.split(",").map(x => x.trim())
-    : true,
-  credentials: false
-}));
-app.use(express.json({ limit: "100kb" }));
+/* =====================================================
+   SQLITE
+===================================================== */
 
-const otpLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000,
-  limit: 5,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many OTP requests. Please wait and try again." }
-});
+const dataDirectory = path.join(
+  __dirname,
+  "data"
+);
 
-const verifyLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000,
-  limit: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many verification attempts. Please wait and try again." }
-});
-
-const staffLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000,
-  limit: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many staff login attempts." }
-});
-
-const MOBILE = /^[6-9]\d{9}$/;
-
-const DEPARTMENTS = {
-  hospital: {
-    name: "Hospital",
-    prefix: "H",
-    avg: 8,
-    services: ["Neurologist","Cardiologist","Orthopaedic","General Physician","Paediatrician","Gynaecologist","Eye (Ophthalmologist)","Skin (Dermatologist)"]
-  },
-  rto: {
-    name: "RTO",
-    prefix: "R",
-    avg: 8,
-    services: ["Driving Licence","Learner Licence","Vehicle Registration","Fitness Certificate"]
-  },
-  tax: {
-    name: "Municipal and Tax",
-    prefix: "M",
-    avg: 7,
-    services: ["Property Tax","Birth Certificate","Death Certificate","Trade Licence"]
-  },
-  id: {
-    name: "Aadhaar and ID",
-    prefix: "A",
-    avg: 5,
-    services: ["New Aadhaar","Update Aadhaar","PAN Card","Voter ID"]
-  },
-  power: {
-    name: "Electricity",
-    prefix: "E",
-    avg: 6,
-    services: ["New Connection","Bill Payment","Complaint","Name Change"]
-  },
-  police: {
-    name: "Police",
-    prefix: "P",
-    avg: 9,
-    services: ["Passport Verification","Character Certificate","Complaint Help Desk","Lost Item Report"]
-  }
-};
-
-const STATES = {
-  "Andhra Pradesh":["Visakhapatnam","Vijayawada","Guntur"],
-  "Arunachal Pradesh":["Itanagar","Tawang","Pasighat"],
-  "Assam":["Guwahati","Dibrugarh","Silchar"],
-  "Bihar":["Patna","Gaya","Muzaffarpur"],
-  "Chhattisgarh":["Raipur","Bilaspur","Durg"],
-  "Goa":["North Goa","South Goa"],
-  "Gujarat":["Rajkot","Ahmedabad","Surat","Vadodara"],
-  "Haryana":["Gurugram","Faridabad","Karnal"],
-  "Himachal Pradesh":["Shimla","Kangra","Mandi"],
-  "Jharkhand":["Ranchi","Dhanbad","East Singhbhum"],
-  "Karnataka":["Bengaluru Urban","Mysuru","Dharwad"],
-  "Kerala":["Thiruvananthapuram","Ernakulam","Kozhikode"],
-  "Madhya Pradesh":["Bhopal","Indore","Jabalpur"],
-  "Maharashtra":["Mumbai","Pune","Nagpur"],
-  "Manipur":["Imphal West","Imphal East","Thoubal"],
-  "Meghalaya":["East Khasi Hills","West Garo Hills","Ri-Bhoi"],
-  "Mizoram":["Aizawl","Lunglei","Champhai"],
-  "Nagaland":["Kohima","Dimapur","Mokokchung"],
-  "Odisha":["Khordha","Cuttack","Puri"],
-  "Punjab":["Ludhiana","Amritsar","Jalandhar"],
-  "Rajasthan":["Jaipur","Jodhpur","Udaipur"],
-  "Sikkim":["Gangtok","Namchi","Gyalshing"],
-  "Tamil Nadu":["Chennai","Coimbatore","Madurai"],
-  "Telangana":["Hyderabad","Warangal","Nizamabad"],
-  "Tripura":["West Tripura","North Tripura","Dhalai"],
-  "Uttar Pradesh":["Lucknow","Kanpur","Varanasi"],
-  "Uttarakhand":["Dehradun","Haridwar","Nainital"],
-  "West Bengal":["Kolkata","Howrah","Darjeeling"],
-  "Andaman and Nicobar Islands":["South Andaman","North and Middle Andaman","Nicobar"],
-  "Chandigarh":["Chandigarh"],
-  "Dadra and Nagar Haveli and Daman and Diu":["Daman","Diu","Dadra and Nagar Haveli"],
-  "Delhi":["New Delhi","South Delhi","North Delhi"],
-  "Jammu and Kashmir":["Srinagar","Jammu","Anantnag"],
-  "Ladakh":["Leh","Kargil"],
-  "Lakshadweep":["Lakshadweep"],
-  "Puducherry":["Puducherry","Karaikal","Mahe"]
-};
-
-function normalizeMobile(value) {
-  const raw = String(value || "").trim().replace(/\s+/g, "");
-  if (raw.startsWith("+91")) return raw.slice(3);
-  if (raw.startsWith("91") && raw.length === 12) return raw.slice(2);
-  return raw;
-}
-
-function phoneE164(mobile) {
-  return `+91${mobile}`;
-}
-
-function signUser(user) {
-  return jwt.sign(
-    { sub: user.id, mobile: user.mobile, role: "customer" },
-    process.env.JWT_SECRET,
-    { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
-  );
-}
-
-function signStaff(staff) {
-  return jwt.sign(
-    { sub: staff.id, username: staff.username, role: staff.role },
-    process.env.JWT_SECRET,
-    { expiresIn: "12h" }
-  );
-}
-
-function auth(req, res, next) {
-  try {
-    const header = req.headers.authorization || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-    if (!token) return res.status(401).json({ error: "Login required." });
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
-    next();
-  } catch {
-    return res.status(401).json({ error: "Invalid or expired login." });
-  }
-}
-
-function staffAuth(req, res, next) {
-  auth(req, res, () => {
-    if (!["staff", "admin"].includes(req.user.role)) {
-      return res.status(403).json({ error: "Staff access required." });
-    }
-    next();
+if (!fs.existsSync(dataDirectory)) {
+  fs.mkdirSync(dataDirectory, {
+    recursive: true
   });
 }
 
-async function audit(mobile, action, status) {
-  await pool.query(
-    "INSERT INTO otp_audit (mobile, action, status) VALUES ($1,$2,$3)",
-    [mobile, action, status]
-  ).catch(() => {});
-}
+const databasePath = path.join(
+  dataDirectory,
+  "queueless.db"
+);
 
-function departmentFromKey(key) {
-  return DEPARTMENTS[key] || null;
-}
+const db = new sqlite3.Database(
+  databasePath
+);
 
-function validateLocation(state, district) {
-  return Boolean(STATES[state] && STATES[state].includes(district));
-}
+db.configure("busyTimeout", 5000);
 
-async function getQueue(client, state, district, departmentKey, service) {
-  const d = departmentFromKey(departmentKey);
-  if (!d) throw new Error("Unknown department.");
-  if (!validateLocation(state, district)) throw new Error("Invalid state or district.");
-  if (!d.services.includes(service)) throw new Error("Invalid service.");
+/* =====================================================
+   DATABASE FUNCTIONS
+===================================================== */
 
-  const result = await client.query(
-    `INSERT INTO queues
-      (state,district,department,service,prefix,avg_service_minutes)
-     VALUES ($1,$2,$3,$4,$5,$6)
-     ON CONFLICT (state,district,department,service)
-     DO UPDATE SET avg_service_minutes = queues.avg_service_minutes
-     RETURNING *`,
-    [state, district, d.name, service, d.prefix, d.avg]
-  );
-  return result.rows[0];
-}
+function run(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (error) {
+      if (error) {
+        reject(error);
+        return;
+      }
 
-async function queueView(client, queue) {
-  const result = await client.query(
-    `SELECT COUNT(*)::int AS waiting
-     FROM tokens WHERE queue_id=$1 AND status='waiting'`,
-    [queue.id]
-  );
-  const waiting = result.rows[0].waiting;
-  const current = await client.query(
-    `SELECT token_code FROM tokens
-     WHERE queue_id=$1 AND status='serving'
-     ORDER BY started_at DESC LIMIT 1`,
-    [queue.id]
-  );
-  const estMin = Math.round(waiting * Number(queue.avg_service_minutes));
-  const level = waiting < 20
-    ? { cls: "g", label: "Normal" }
-    : waiting < 30
-      ? { cls: "y", label: "Busy" }
-      : { cls: "r", label: "Very Busy" };
-
-  return {
-    state: queue.state,
-    district: queue.district,
-    department: queue.department,
-    service: queue.service,
-    serving: current.rows[0]?.token_code || null,
-    waiting,
-    estMin,
-    avg: Number(queue.avg_service_minutes),
-    ...level
-  };
-}
-
-async function tokenView(client, tokenId) {
-  const result = await client.query(
-    `SELECT t.*, q.state, q.district, q.department, q.service,
-            q.avg_service_minutes
-     FROM tokens t JOIN queues q ON q.id=t.queue_id
-     WHERE t.id=$1`,
-    [tokenId]
-  );
-  if (!result.rows[0]) return null;
-  const t = result.rows[0];
-
-  const ahead = t.status === "waiting"
-    ? (await client.query(
-        `SELECT COUNT(*)::int AS n FROM tokens
-         WHERE queue_id=$1 AND status='waiting' AND token_number < $2`,
-        [t.queue_id, t.token_number]
-      )).rows[0].n
-    : 0;
-
-  const current = await client.query(
-    `SELECT token_code FROM tokens
-     WHERE queue_id=$1 AND status='serving'
-     ORDER BY started_at DESC LIMIT 1`,
-    [t.queue_id]
-  );
-
-  return {
-    id: t.id,
-    code: t.token_code,
-    no: t.token_number,
-    state: t.state,
-    district: t.district,
-    dept: t.department,
-    service: t.service,
-    status: t.status,
-    serving: current.rows[0]?.token_code || null,
-    ahead,
-    estMin: Math.round(ahead * Number(t.avg_service_minutes)),
-    alert: t.status === "waiting" && ahead <= 2,
-    createdAt: t.created_at
-  };
-}
-
-app.get("/api/health", async (_req, res) => {
-  try {
-    await pool.query("SELECT 1");
-    res.json({ ok: true, service: "QueueLess API" });
-  } catch {
-    res.status(503).json({ ok: false });
-  }
-});
-
-app.get("/api/departments", (_req, res) => {
-  res.json(Object.entries(DEPARTMENTS).map(([key, d]) => ({
-    key, name: d.name, prefix: d.prefix, avg: d.avg, services: d.services
-  })));
-});
-
-app.get("/api/locations", (req, res) => {
-  const dept = req.query.dept;
-  if (!dept) return res.json(STATES);
-  const d = Object.values(DEPARTMENTS).find(x => x.name === dept);
-  if (!d) return res.json(STATES);
-  res.json(STATES);
-});
-
-/*
-  REAL OTP:
-  1. Browser calls /auth/send-code.
-  2. Twilio Verify sends the SMS.
-  3. Browser calls /auth/verify with the received code.
-  4. Twilio confirms it.
-  5. Only then is our JWT issued.
-*/
-app.post("/api/auth/send-code", otpLimiter, async (req, res) => {
-  try {
-    const mobile = normalizeMobile(req.body.mobile);
-    if (!MOBILE.test(mobile)) {
-      return res.status(400).json({ error: "Enter a valid Indian mobile number." });
-    }
-
-    await twilioClient.verify.v2
-      .services(process.env.TWILIO_VERIFY_SERVICE_SID)
-      .verifications
-      .create({ to: phoneE164(mobile), channel: "sms" });
-
-    await audit(mobile, "send", "sent");
-    res.json({ ok: true, message: "OTP sent successfully." });
-  } catch (err) {
-    console.error("OTP SEND:", err.message);
-    await audit(normalizeMobile(req.body.mobile), "send", "failed");
-    res.status(502).json({ error: "Unable to send OTP right now. Please try again." });
-  }
-});
-
-app.post("/api/auth/verify", verifyLimiter, async (req, res) => {
-  try {
-    const mobile = normalizeMobile(req.body.mobile);
-    const code = String(req.body.code || "").trim();
-
-    if (!MOBILE.test(mobile) || !/^\d{4,10}$/.test(code)) {
-      return res.status(400).json({ error: "Invalid mobile number or OTP." });
-    }
-
-    const verification = await twilioClient.verify.v2
-      .services(process.env.TWILIO_VERIFY_SERVICE_SID)
-      .verificationChecks
-      .create({ to: phoneE164(mobile), code });
-
-    if (verification.status !== "approved") {
-      await audit(mobile, "verify", verification.status || "rejected");
-      return res.status(401).json({ error: "Invalid or expired OTP." });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO users (mobile, verified_at)
-       VALUES ($1, NOW())
-       ON CONFLICT (mobile)
-       DO UPDATE SET verified_at=NOW()
-       RETURNING id, mobile, name`,
-      [mobile]
-    );
-
-    await audit(mobile, "verify", "approved");
-
-    res.json({
-      ok: true,
-      token: signUser(result.rows[0]),
-      user: result.rows[0]
-    });
-  } catch (err) {
-    console.error("OTP VERIFY:", err.message);
-    await audit(normalizeMobile(req.body.mobile), "verify", "failed");
-    res.status(401).json({ error: "OTP verification failed." });
-  }
-});
-
-app.get("/api/me", auth, async (req, res) => {
-  const result = await pool.query(
-    "SELECT id,mobile,name,verified_at FROM users WHERE id=$1",
-    [req.user.sub]
-  );
-  if (!result.rows[0]) return res.status(404).json({ error: "User not found." });
-  res.json(result.rows[0]);
-});
-
-app.patch("/api/me", auth, async (req, res) => {
-  const name = String(req.body.name || "").trim().slice(0, 80);
-  if (name.length < 2) return res.status(400).json({ error: "Enter your name." });
-
-  const result = await pool.query(
-    "UPDATE users SET name=$1 WHERE id=$2 RETURNING id,mobile,name,verified_at",
-    [name, req.user.sub]
-  );
-  res.json(result.rows[0]);
-});
-
-app.get("/api/queue-status", async (req, res) => {
-  const { state, district, dept, service } = req.query;
-  try {
-    const client = await pool.connect();
-    try {
-      const q = await getQueue(client, state, district, dept, service);
-      res.json(await queueView(client, q));
-    } finally {
-      client.release();
-    }
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.post("/api/tokens", auth, async (req, res) => {
-  const { state, district, dept, service } = req.body;
-  const client = await pool.connect();
-
-  try {
-    await client.query("BEGIN");
-
-    const user = await client.query(
-      "SELECT id,mobile,name FROM users WHERE id=$1",
-      [req.user.sub]
-    );
-    if (!user.rows[0]) throw new Error("User not found.");
-
-    const name = String(req.body.name || user.rows[0].name || "").trim().slice(0, 80);
-    if (name.length < 2) throw new Error("Please enter your name.");
-
-    await client.query(
-      "UPDATE users SET name=$1 WHERE id=$2",
-      [name, req.user.sub]
-    );
-
-    const q = await getQueue(client, state, district, dept, service);
-
-    const duplicate = await client.query(
-      `SELECT token_code FROM tokens
-       WHERE user_id=$1 AND queue_id=$2
-       AND status IN ('waiting','serving','hold')
-       LIMIT 1`,
-      [req.user.sub, q.id]
-    );
-    if (duplicate.rows[0]) {
-      const e = new Error(`You already have token ${duplicate.rows[0].token_code} in this queue.`);
-      e.status = 409;
-      throw e;
-    }
-
-    const numberResult = await client.query(
-      `UPDATE queues
-       SET next_number=next_number+1
-       WHERE id=$1
-       RETURNING next_number-1 AS token_number`,
-      [q.id]
-    );
-    const tokenNumber = numberResult.rows[0].token_number;
-    const tokenCode = `${q.prefix}-${String(tokenNumber).padStart(3, "0")}`;
-
-    const inserted = await client.query(
-      `INSERT INTO tokens
-       (queue_id,user_id,token_number,token_code,name,mobile)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       RETURNING id`,
-      [q.id, req.user.sub, tokenNumber, tokenCode, name, user.rows[0].mobile]
-    );
-
-    await client.query("COMMIT");
-
-    const view = await tokenView(client, inserted.rows[0].id);
-    res.status(201).json(view);
-  } catch (err) {
-    await client.query("ROLLBACK");
-    res.status(err.status || 400).json({ error: err.message });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/api/tokens/:id", async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const view = await tokenView(client, req.params.id);
-    if (!view) return res.status(404).json({ error: "Token not found." });
-    res.json(view);
-  } finally {
-    client.release();
-  }
-});
-
-app.delete("/api/tokens/:id", auth, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const check = await client.query(
-      "SELECT id FROM tokens WHERE id=$1 AND user_id=$2",
-      [req.params.id, req.user.sub]
-    );
-    if (!check.rows[0]) return res.status(404).json({ error: "Token not found." });
-
-    const result = await client.query(
-      `UPDATE tokens SET status='cancelled', ended_at=NOW()
-       WHERE id=$1 AND status IN ('waiting','hold')
-       RETURNING id`,
-      [req.params.id]
-    );
-    if (!result.rows[0]) {
-      return res.status(400).json({ error: "This token cannot be cancelled now." });
-    }
-
-    res.json(await tokenView(client, req.params.id));
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/api/my-tokens", auth, async (req, res) => {
-  const result = await pool.query(
-    `SELECT id FROM tokens
-     WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`,
-    [req.user.sub]
-  );
-
-  const client = await pool.connect();
-  try {
-    const out = [];
-    for (const row of result.rows) out.push(await tokenView(client, row.id));
-    res.json(out);
-  } finally {
-    client.release();
-  }
-});
-
-/* Staff login is username/password, not a hard-coded demo PIN. */
-app.post("/api/staff/login", staffLimiter, async (req, res) => {
-  const username = String(req.body.username || "").trim();
-  const password = String(req.body.password || "");
-
-  const result = await pool.query(
-    "SELECT id,username,password_hash,role FROM staff_users WHERE username=$1",
-    [username]
-  );
-  const staff = result.rows[0];
-
-  if (!staff || !(await bcrypt.compare(password, staff.password_hash))) {
-    return res.status(401).json({ error: "Invalid staff credentials." });
-  }
-
-  res.json({
-    ok: true,
-    token: signStaff(staff),
-    staff: { id: staff.id, username: staff.username, role: staff.role }
-  });
-});
-
-app.get("/api/staff/queue", staffAuth, async (req, res) => {
-  const { state, district, dept, service } = req.query;
-  try {
-    const client = await pool.connect();
-    try {
-      const q = await getQueue(client, state, district, dept, service);
-      const waiting = await client.query(
-        `SELECT id,token_code,name,status,created_at
-         FROM tokens WHERE queue_id=$1 AND status IN ('waiting','serving','hold')
-         ORDER BY token_number`,
-        [q.id]
-      );
-      res.json({
-        queue: await queueView(client, q),
-        tokens: waiting.rows
+      resolve({
+        id: this.lastID,
+        changes: this.changes
       });
-    } finally {
-      client.release();
-    }
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
+    });
+  });
+}
 
-app.post("/api/staff/next", staffAuth, async (req, res) => {
-  const { state, district, dept, service } = req.body;
-  const client = await pool.connect();
+function get(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (error, row) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve(row);
+    });
+  });
+}
+
+function all(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (error, rows) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve(rows);
+    });
+  });
+}
+
+function exec(sql) {
+  return new Promise((resolve, reject) => {
+    db.exec(sql, error => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    });
+  });
+}
+
+/* =====================================================
+   DATABASE INITIALIZATION
+===================================================== */
+
+async function initializeDatabase() {
+  await exec(`
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      phone TEXT UNIQUE NOT NULL,
+      name TEXT DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS staff_users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      phone TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      pin_hash TEXT NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS queues (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      state TEXT NOT NULL,
+      district TEXT NOT NULL,
+      department TEXT NOT NULL,
+      service TEXT NOT NULL,
+      next_number INTEGER NOT NULL DEFAULT 1,
+      current_number INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(
+        state,
+        district,
+        department,
+        service
+      )
+    );
+
+    CREATE TABLE IF NOT EXISTS tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      queue_id INTEGER NOT NULL,
+      token_number INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'waiting',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      called_at TEXT,
+      completed_at TEXT,
+
+      FOREIGN KEY(user_id)
+        REFERENCES users(id),
+
+      FOREIGN KEY(queue_id)
+        REFERENCES queues(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS otp_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      phone TEXT NOT NULL,
+      action TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tokens_user
+      ON tokens(user_id);
+
+    CREATE INDEX IF NOT EXISTS idx_tokens_queue
+      ON tokens(queue_id);
+
+    CREATE INDEX IF NOT EXISTS idx_tokens_status
+      ON tokens(status);
+  `);
+
+  console.log(
+    "SQLite database initialized:"
+  );
+
+  console.log(databasePath);
+}
+
+/* =====================================================
+   UTILITY
+===================================================== */
+
+function normalizePhone(phone) {
+  if (!phone) {
+    return "";
+  }
+
+  return String(phone)
+    .trim()
+    .replace(/[()\s-]/g, "");
+}
+
+function createUserToken(userId) {
+  return jwt.sign(
+    {
+      userId: userId,
+      type: "user"
+    },
+    JWT_SECRET,
+    {
+      expiresIn:
+        process.env.JWT_EXPIRES_IN || "7d"
+    }
+  );
+}
+
+function createStaffToken(staffId) {
+  return jwt.sign(
+    {
+      staffId: staffId,
+      type: "staff"
+    },
+    JWT_SECRET,
+    {
+      expiresIn:
+        process.env.JWT_EXPIRES_IN || "7d"
+    }
+  );
+}
+
+/* =====================================================
+   MIDDLEWARE
+===================================================== */
+
+function authenticateUser(
+  req,
+  res,
+  next
+) {
+  const header =
+    req.headers.authorization || "";
+
+  if (!header.startsWith("Bearer ")) {
+    return res.status(401).json({
+      error: "Authentication required"
+    });
+  }
+
+  const token = header.substring(7);
 
   try {
-    await client.query("BEGIN");
-    const q = await getQueue(client, state, district, dept, service);
-
-    const current = await client.query(
-      `SELECT id FROM tokens
-       WHERE queue_id=$1 AND status='serving'
-       ORDER BY started_at LIMIT 1`,
-      [q.id]
+    const payload = jwt.verify(
+      token,
+      JWT_SECRET
     );
-    if (current.rows[0]) {
-      await client.query(
-        "UPDATE tokens SET status='done', ended_at=NOW() WHERE id=$1",
-        [current.rows[0].id]
+
+    if (payload.type !== "user") {
+      return res.status(401).json({
+        error: "Invalid user token"
+      });
+    }
+
+    req.userId = payload.userId;
+
+    next();
+  } catch (error) {
+    return res.status(401).json({
+      error: "Invalid or expired token"
+    });
+  }
+}
+
+function authenticateStaff(
+  req,
+  res,
+  next
+) {
+  const header =
+    req.headers.authorization || "";
+
+  if (!header.startsWith("Bearer ")) {
+    return res.status(401).json({
+      error:
+        "Staff authentication required"
+    });
+  }
+
+  const token = header.substring(7);
+
+  try {
+    const payload = jwt.verify(
+      token,
+      JWT_SECRET
+    );
+
+    if (payload.type !== "staff") {
+      return res.status(401).json({
+        error: "Invalid staff token"
+      });
+    }
+
+    req.staffId = payload.staffId;
+
+    next();
+  } catch (error) {
+    return res.status(401).json({
+      error: "Invalid or expired token"
+    });
+  }
+}
+
+/* =====================================================
+   EXPRESS
+===================================================== */
+
+app.use(
+  helmet({
+    crossOriginResourcePolicy: false
+  })
+);
+
+app.use(
+  cors({
+    origin: [
+      FRONTEND_URL,
+      "http://localhost:5173",
+      "http://localhost:3000"
+    ],
+    credentials: true
+  })
+);
+
+app.use(express.json());
+
+const authLimiter =
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false
+  });
+
+app.use(
+  "/api/auth",
+  authLimiter
+);
+
+/* =====================================================
+   QUEUE HELPER
+===================================================== */
+
+async function getOrCreateQueue(
+  state,
+  district,
+  department,
+  service
+) {
+  let queue = await get(
+    `
+    SELECT *
+    FROM queues
+    WHERE state = ?
+      AND district = ?
+      AND department = ?
+      AND service = ?
+    `,
+    [
+      state,
+      district,
+      department,
+      service
+    ]
+  );
+
+  if (!queue) {
+    const result = await run(
+      `
+      INSERT INTO queues
+      (
+        state,
+        district,
+        department,
+        service,
+        next_number,
+        current_number
+      )
+      VALUES (?, ?, ?, ?, 1, 0)
+      `,
+      [
+        state,
+        district,
+        department,
+        service
+      ]
+    );
+
+    queue = await get(
+      `
+      SELECT *
+      FROM queues
+      WHERE id = ?
+      `,
+      [result.id]
+    );
+  }
+
+  return queue;
+}
+
+/* =====================================================
+   HEALTH
+===================================================== */
+
+app.get(
+  "/api/health",
+  async (req, res) => {
+    try {
+      await get(
+        "SELECT 1 AS ok"
       );
+
+      res.json({
+        ok: true,
+        service:
+          "queueless-backend",
+        database: "sqlite",
+        timestamp:
+          new Date().toISOString()
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        ok: false,
+        error:
+          "Database unavailable"
+      });
     }
-
-    const next = await client.query(
-      `SELECT id FROM tokens
-       WHERE queue_id=$1 AND status='waiting'
-       ORDER BY token_number LIMIT 1
-       FOR UPDATE SKIP LOCKED`,
-      [q.id]
-    );
-
-    if (!next.rows[0]) {
-      await client.query("COMMIT");
-      return res.json({ ok: true, current: null, message: "No one is waiting." });
-    }
-
-    await client.query(
-      `UPDATE tokens SET status='serving', started_at=NOW()
-       WHERE id=$1`,
-      [next.rows[0].id]
-    );
-
-    await client.query("COMMIT");
-    res.json({ ok: true, current: await tokenView(client, next.rows[0].id) });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    res.status(400).json({ error: err.message });
-  } finally {
-    client.release();
   }
-});
+);
 
-app.post("/api/staff/skip", staffAuth, async (req, res) => {
-  const { state, district, dept, service } = req.body;
-  const client = await pool.connect();
+/* =====================================================
+   DEPARTMENTS
+===================================================== */
+
+app.get(
+  "/api/departments",
+  (req, res) => {
+    res.json([
+      {
+        id: "general",
+        name: "General Services"
+      },
+      {
+        id: "hospital",
+        name: "Hospital"
+      },
+      {
+        id: "bank",
+        name: "Banking"
+      },
+      {
+        id: "government",
+        name:
+          "Government Services"
+      }
+    ]);
+  }
+);
+
+/* =====================================================
+   LOCATIONS
+===================================================== */
+
+app.get(
+  "/api/locations",
+  (req, res) => {
+    res.json([]);
+  }
+);
+
+/* =====================================================
+   SEND OTP
+===================================================== */
+
+app.post(
+  "/api/auth/send-code",
+  async (req, res) => {
+    try {
+      const phone =
+        normalizePhone(
+          req.body.phone
+        );
+
+      if (!phone) {
+        return res.status(400).json({
+          error:
+            "Phone number is required"
+        });
+      }
+
+      await twilioClient.verify.v2
+        .services(
+          TWILIO_VERIFY_SERVICE_SID
+        )
+        .verifications.create({
+          to: phone,
+          channel: "sms"
+        });
+
+      await run(
+        `
+        INSERT INTO otp_audit
+        (
+          phone,
+          action
+        )
+        VALUES (?, ?)
+        `,
+        [
+          phone,
+          "send"
+        ]
+      );
+
+      res.json({
+        success: true,
+        message:
+          "Verification code sent"
+      });
+    } catch (error) {
+      console.error(
+        "SEND OTP ERROR:",
+        error.message
+      );
+
+      res.status(400).json({
+        error:
+          error.message ||
+          "Unable to send verification code"
+      });
+    }
+  }
+);
+
+/* =====================================================
+   VERIFY OTP
+===================================================== */
+
+app.post(
+  "/api/auth/verify",
+  async (req, res) => {
+    try {
+      const phone =
+        normalizePhone(
+          req.body.phone
+        );
+
+      const code =
+        String(
+          req.body.code || ""
+        ).trim();
+
+      if (!phone || !code) {
+        return res.status(400).json({
+          error:
+            "Phone number and code are required"
+        });
+      }
+
+      const verificationCheck =
+        await twilioClient.verify.v2
+          .services(
+            TWILIO_VERIFY_SERVICE_SID
+          )
+          .verificationChecks.create({
+            to: phone,
+            code: code
+          });
+
+      if (
+        verificationCheck.status !==
+        "approved"
+      ) {
+        return res.status(401).json({
+          error:
+            "Invalid verification code"
+        });
+      }
+
+      let user = await get(
+        `
+        SELECT *
+        FROM users
+        WHERE phone = ?
+        `,
+        [phone]
+      );
+
+      if (!user) {
+        const result = await run(
+          `
+          INSERT INTO users
+          (
+            phone,
+            name
+          )
+          VALUES (?, ?)
+          `,
+          [
+            phone,
+            ""
+          ]
+        );
+
+        user = await get(
+          `
+          SELECT *
+          FROM users
+          WHERE id = ?
+          `,
+          [result.id]
+        );
+      }
+
+      await run(
+        `
+        INSERT INTO otp_audit
+        (
+          phone,
+          action
+        )
+        VALUES (?, ?)
+        `,
+        [
+          phone,
+          "verify"
+        ]
+      );
+
+      const token =
+        createUserToken(
+          user.id
+        );
+
+      res.json({
+        success: true,
+
+        token,
+
+        user: {
+          id: user.id,
+          phone: user.phone,
+          name: user.name
+        }
+      });
+    } catch (error) {
+      console.error(
+        "VERIFY OTP ERROR:",
+        error.message
+      );
+
+      res.status(401).json({
+        error:
+          error.message ||
+          "Verification failed"
+      });
+    }
+  }
+);
+
+/* =====================================================
+   GET CURRENT USER
+===================================================== */
+
+app.get(
+  "/api/me",
+  authenticateUser,
+  async (req, res) => {
+    try {
+      const user = await get(
+        `
+        SELECT
+          id,
+          phone,
+          name,
+          created_at
+        FROM users
+        WHERE id = ?
+        `,
+        [req.userId]
+      );
+
+      if (!user) {
+        return res.status(404).json({
+          error:
+            "User not found"
+        });
+      }
+
+      res.json({
+        user
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error:
+          "Unable to load user"
+      });
+    }
+  }
+);
+
+/* =====================================================
+   UPDATE USER
+===================================================== */
+
+app.patch(
+  "/api/me",
+  authenticateUser,
+  async (req, res) => {
+    try {
+      const name =
+        String(
+          req.body.name || ""
+        ).trim();
+
+      await run(
+        `
+        UPDATE users
+        SET
+          name = ?,
+          updated_at =
+            CURRENT_TIMESTAMP
+        WHERE id = ?
+        `,
+        [
+          name,
+          req.userId
+        ]
+      );
+
+      const user = await get(
+        `
+        SELECT
+          id,
+          phone,
+          name,
+          created_at
+        FROM users
+        WHERE id = ?
+        `,
+        [req.userId]
+      );
+
+      res.json({
+        user
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error:
+          "Unable to update profile"
+      });
+    }
+  }
+);
+
+/* =====================================================
+   QUEUE STATUS
+===================================================== */
+
+app.get(
+  "/api/queue-status",
+  async (req, res) => {
+    try {
+      const state =
+        String(
+          req.query.state || ""
+        ).trim();
+
+      const district =
+        String(
+          req.query.district || ""
+        ).trim();
+
+      const department =
+        String(
+          req.query.dept ||
+            req.query.department ||
+            ""
+        ).trim();
+
+      const service =
+        String(
+          req.query.service || ""
+        ).trim();
+
+      if (
+        !state ||
+        !district ||
+        !department ||
+        !service
+      ) {
+        return res.status(400).json({
+          error:
+            "state, district, dept and service are required"
+        });
+      }
+
+      const queue =
+        await getOrCreateQueue(
+          state,
+          district,
+          department,
+          service
+        );
+
+      const waiting =
+        await get(
+          `
+          SELECT COUNT(*) AS count
+          FROM tokens
+          WHERE queue_id = ?
+            AND status = 'waiting'
+          `,
+          [queue.id]
+        );
+
+      res.json({
+        queue: {
+          id: queue.id,
+          state: queue.state,
+          district:
+            queue.district,
+          department:
+            queue.department,
+          service:
+            queue.service,
+          current_number:
+            queue.current_number,
+          next_number:
+            queue.next_number,
+          waiting_count:
+            waiting.count
+        }
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error:
+          "Unable to load queue status"
+      });
+    }
+  }
+);
+
+/* =====================================================
+   CREATE TOKEN
+===================================================== */
+
+app.post(
+  "/api/tokens",
+  authenticateUser,
+  async (req, res) => {
+    try {
+      const state =
+        String(
+          req.body.state || ""
+        ).trim();
+
+      const district =
+        String(
+          req.body.district || ""
+        ).trim();
+
+      const department =
+        String(
+          req.body.dept ||
+            req.body.department ||
+            ""
+        ).trim();
+
+      const service =
+        String(
+          req.body.service || ""
+        ).trim();
+
+      if (
+        !state ||
+        !district ||
+        !department ||
+        !service
+      ) {
+        return res.status(400).json({
+          error:
+            "state, district, dept and service are required"
+        });
+      }
+
+      const queue =
+        await getOrCreateQueue(
+          state,
+          district,
+          department,
+          service
+        );
+
+      const tokenNumber =
+        queue.next_number;
+
+      await run(
+        `
+        UPDATE queues
+        SET
+          next_number =
+            next_number + 1
+        WHERE id = ?
+        `,
+        [queue.id]
+      );
+
+      const result =
+        await run(
+          `
+          INSERT INTO tokens
+          (
+            user_id,
+            queue_id,
+            token_number,
+            status
+          )
+          VALUES (?, ?, ?, 'waiting')
+          `,
+          [
+            req.userId,
+            queue.id,
+            tokenNumber
+          ]
+        );
+
+      const token =
+        await get(
+          `
+          SELECT
+            t.id,
+            t.token_number,
+            t.status,
+            t.created_at,
+            q.state,
+            q.district,
+            q.department,
+            q.service,
+            q.current_number
+          FROM tokens t
+          JOIN queues q
+            ON q.id = t.queue_id
+          WHERE t.id = ?
+          `,
+          [result.id]
+        );
+
+      res.status(201).json({
+        success: true,
+        token
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error:
+          "Unable to create token"
+      });
+    }
+  }
+);
+
+/* =====================================================
+   GET TOKEN
+===================================================== */
+
+app.get(
+  "/api/tokens/:id",
+  authenticateUser,
+  async (req, res) => {
+    try {
+      const token =
+        await get(
+          `
+          SELECT
+            t.id,
+            t.token_number,
+            t.status,
+            t.created_at,
+            t.called_at,
+            t.completed_at,
+            q.id AS queue_id,
+            q.state,
+            q.district,
+            q.department,
+            q.service,
+            q.current_number
+          FROM tokens t
+          JOIN queues q
+            ON q.id = t.queue_id
+          WHERE
+            t.id = ?
+            AND t.user_id = ?
+          `,
+          [
+            req.params.id,
+            req.userId
+          ]
+        );
+
+      if (!token) {
+        return res.status(404).json({
+          error:
+            "Token not found"
+        });
+      }
+
+      const ahead =
+        await get(
+          `
+          SELECT COUNT(*) AS count
+          FROM tokens
+          WHERE
+            queue_id = ?
+            AND status = 'waiting'
+            AND id < ?
+          `,
+          [
+            token.queue_id,
+            token.id
+          ]
+        );
+
+      res.json({
+        token,
+        people_ahead:
+          ahead.count
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error:
+          "Unable to load token"
+      });
+    }
+  }
+);
+
+/* =====================================================
+   MY TOKENS
+===================================================== */
+
+app.get(
+  "/api/my-tokens",
+  authenticateUser,
+  async (req, res) => {
+    try {
+      const tokens =
+        await all(
+          `
+          SELECT
+            t.id,
+            t.token_number,
+            t.status,
+            t.created_at,
+            t.called_at,
+            t.completed_at,
+            q.state,
+            q.district,
+            q.department,
+            q.service,
+            q.current_number
+          FROM tokens t
+          JOIN queues q
+            ON q.id = t.queue_id
+          WHERE t.user_id = ?
+          ORDER BY t.id DESC
+          `,
+          [req.userId]
+        );
+
+      res.json({
+        tokens
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error:
+          "Unable to load tokens"
+      });
+    }
+  }
+);
+
+/* =====================================================
+   CANCEL TOKEN
+===================================================== */
+
+app.delete(
+  "/api/tokens/:id",
+  authenticateUser,
+  async (req, res) => {
+    try {
+      const token =
+        await get(
+          `
+          SELECT *
+          FROM tokens
+          WHERE
+            id = ?
+            AND user_id = ?
+          `,
+          [
+            req.params.id,
+            req.userId
+          ]
+        );
+
+      if (!token) {
+        return res.status(404).json({
+          error:
+            "Token not found"
+        });
+      }
+
+      if (
+        token.status !==
+        "waiting"
+      ) {
+        return res.status(400).json({
+          error:
+            "Only waiting tokens can be cancelled"
+        });
+      }
+
+      await run(
+        `
+        UPDATE tokens
+        SET
+          status = 'cancelled',
+          completed_at =
+            CURRENT_TIMESTAMP
+        WHERE id = ?
+        `,
+        [token.id]
+      );
+
+      res.json({
+        success: true,
+        message:
+          "Token cancelled"
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error:
+          "Unable to cancel token"
+      });
+    }
+  }
+);
+
+/* =====================================================
+   STAFF LOGIN
+===================================================== */
+
+app.post(
+  "/api/staff/login",
+  async (req, res) => {
+    try {
+      const phone =
+        normalizePhone(
+          req.body.phone
+        );
+
+      const pin =
+        String(
+          req.body.pin || ""
+        ).trim();
+
+      if (!phone || !pin) {
+        return res.status(400).json({
+          error:
+            "Phone and PIN are required"
+        });
+      }
+
+      const staff =
+        await get(
+          `
+          SELECT *
+          FROM staff_users
+          WHERE
+            phone = ?
+            AND active = 1
+          `,
+          [phone]
+        );
+
+      if (!staff) {
+        return res.status(401).json({
+          error:
+            "Invalid staff credentials"
+        });
+      }
+
+      const validPin =
+        await bcrypt.compare(
+          pin,
+          staff.pin_hash
+        );
+
+      if (!validPin) {
+        return res.status(401).json({
+          error:
+            "Invalid staff credentials"
+        });
+      }
+
+      const token =
+        createStaffToken(
+          staff.id
+        );
+
+      res.json({
+        success: true,
+
+        token,
+
+        staff: {
+          id: staff.id,
+          phone: staff.phone,
+          name: staff.name
+        }
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error:
+          "Unable to login"
+      });
+    }
+  }
+);
+
+/* =====================================================
+   STAFF QUEUE
+===================================================== */
+
+app.get(
+  "/api/staff/queue",
+  authenticateStaff,
+  async (req, res) => {
+    try {
+      const state =
+        String(
+          req.query.state || ""
+        ).trim();
+
+      const district =
+        String(
+          req.query.district || ""
+        ).trim();
+
+      const department =
+        String(
+          req.query.dept ||
+            req.query.department ||
+            ""
+        ).trim();
+
+      const service =
+        String(
+          req.query.service || ""
+        ).trim();
+
+      if (
+        !state ||
+        !district ||
+        !department ||
+        !service
+      ) {
+        return res.status(400).json({
+          error:
+            "state, district, dept and service are required"
+        });
+      }
+
+      const queue =
+        await getOrCreateQueue(
+          state,
+          district,
+          department,
+          service
+        );
+
+      const tokens =
+        await all(
+          `
+          SELECT
+            id,
+            token_number,
+            status,
+            created_at,
+            called_at,
+            completed_at
+          FROM tokens
+          WHERE queue_id = ?
+          ORDER BY token_number ASC
+          `,
+          [queue.id]
+        );
+
+      res.json({
+        queue,
+        tokens
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error:
+          "Unable to load staff queue"
+      });
+    }
+  }
+);
+
+/* =====================================================
+   STAFF NEXT
+===================================================== */
+
+app.post(
+  "/api/staff/next",
+  authenticateStaff,
+  async (req, res) => {
+    try {
+      const state =
+        String(
+          req.body.state || ""
+        ).trim();
+
+      const district =
+        String(
+          req.body.district || ""
+        ).trim();
+
+      const department =
+        String(
+          req.body.dept ||
+            req.body.department ||
+            ""
+        ).trim();
+
+      const service =
+        String(
+          req.body.service || ""
+        ).trim();
+
+      if (
+        !state ||
+        !district ||
+        !department ||
+        !service
+      ) {
+        return res.status(400).json({
+          error:
+            "state, district, dept and service are required"
+        });
+      }
+
+      const queue =
+        await getOrCreateQueue(
+          state,
+          district,
+          department,
+          service
+        );
+
+      const nextToken =
+        await get(
+          `
+          SELECT *
+          FROM tokens
+          WHERE
+            queue_id = ?
+            AND status = 'waiting'
+          ORDER BY token_number ASC
+          LIMIT 1
+          `,
+          [queue.id]
+        );
+
+      if (!nextToken) {
+        return res.json({
+          success: false,
+          message:
+            "No waiting tokens"
+        });
+      }
+
+      await run(
+        `
+        UPDATE tokens
+        SET
+          status = 'serving',
+          called_at =
+            CURRENT_TIMESTAMP
+        WHERE id = ?
+        `,
+        [nextToken.id]
+      );
+
+      await run(
+        `
+        UPDATE queues
+        SET
+          current_number = ?
+        WHERE id = ?
+        `,
+        [
+          nextToken.token_number,
+          queue.id
+        ]
+      );
+
+      const updated =
+        await get(
+          `
+          SELECT *
+          FROM tokens
+          WHERE id = ?
+          `,
+          [nextToken.id]
+        );
+
+      res.json({
+        success: true,
+        token: updated
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error:
+          "Unable to call next token"
+      });
+    }
+  }
+);
+
+/* =====================================================
+   STAFF SKIP
+===================================================== */
+
+app.post(
+  "/api/staff/skip",
+  authenticateStaff,
+  async (req, res) => {
+    try {
+      const state =
+        String(
+          req.body.state || ""
+        ).trim();
+
+      const district =
+        String(
+          req.body.district || ""
+        ).trim();
+
+      const department =
+        String(
+          req.body.dept ||
+            req.body.department ||
+            ""
+        ).trim();
+
+      const service =
+        String(
+          req.body.service || ""
+        ).trim();
+
+      if (
+        !state ||
+        !district ||
+        !department ||
+        !service
+      ) {
+        return res.status(400).json({
+          error:
+            "state, district, dept and service are required"
+        });
+      }
+
+      const queue =
+        await getOrCreateQueue(
+          state,
+          district,
+          department,
+          service
+        );
+
+      const current =
+        await get(
+          `
+          SELECT *
+          FROM tokens
+          WHERE
+            queue_id = ?
+            AND status = 'serving'
+          ORDER BY called_at DESC
+          LIMIT 1
+          `,
+          [queue.id]
+        );
+
+      if (!current) {
+        return res.json({
+          success: false,
+          message:
+            "No serving token"
+        });
+      }
+
+      await run(
+        `
+        UPDATE tokens
+        SET
+          status = 'skipped',
+          completed_at =
+            CURRENT_TIMESTAMP
+        WHERE id = ?
+        `,
+        [current.id]
+      );
+
+      res.json({
+        success: true,
+        message:
+          "Token skipped"
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error:
+          "Unable to skip token"
+      });
+    }
+  }
+);
+
+/* =====================================================
+   CREATE STAFF FROM RENDER ENVIRONMENT
+===================================================== */
+
+async function createStaffFromEnvironment() {
+  const phone =
+    process.env.STAFF_PHONE;
+
+  const name =
+    process.env.STAFF_NAME;
+
+  const pin =
+    process.env.STAFF_PIN;
+
+  if (!phone || !name || !pin) {
+    console.log(
+      "Staff environment variables not provided."
+    );
+
+    return;
+  }
+
+  const normalizedPhone =
+    normalizePhone(phone);
+
+  const existing =
+    await get(
+      `
+      SELECT id
+      FROM staff_users
+      WHERE phone = ?
+      `,
+      [normalizedPhone]
+    );
+
+  if (existing) {
+    console.log(
+      "Staff account already exists."
+    );
+
+    return;
+  }
+
+  const pinHash =
+    await bcrypt.hash(
+      pin,
+      12
+    );
+
+  await run(
+    `
+    INSERT INTO staff_users
+    (
+      phone,
+      name,
+      pin_hash,
+      active
+    )
+    VALUES (?, ?, ?, 1)
+    `,
+    [
+      normalizedPhone,
+      name,
+      pinHash
+    ]
+  );
+
+  console.log(
+    "Initial staff account created."
+  );
+}
+
+/* =====================================================
+   START SERVER
+===================================================== */
+
+async function startServer() {
   try {
-    const q = await getQueue(client, state, district, dept, service);
-    const current = await client.query(
-      `SELECT id FROM tokens WHERE queue_id=$1 AND status='serving'
-       ORDER BY started_at LIMIT 1`,
-      [q.id]
-    );
-    if (!current.rows[0]) return res.status(400).json({ error: "No token is currently serving." });
+    await initializeDatabase();
 
-    await client.query(
-      "UPDATE tokens SET status='skipped', ended_at=NOW() WHERE id=$1",
-      [current.rows[0].id]
+    await createStaffFromEnvironment();
+
+    app.listen(
+      PORT,
+      "0.0.0.0",
+      () => {
+        console.log(
+          `QueueLess backend running on port ${PORT}`
+        );
+
+        console.log(
+          "Health endpoint: /api/health"
+        );
+      }
     );
-    res.json({ ok: true, queue: await queueView(client, q) });
-  } finally {
-    client.release();
+  } catch (error) {
+    console.error(
+      "SERVER STARTUP ERROR:",
+      error
+    );
+
+    process.exit(1);
   }
-});
+}
 
-app.use((err, _req, res, _next) => {
-  console.error(err);
-  res.status(500).json({ error: "Internal server error." });
-});
+startServer();
 
-app.listen(PORT, () => {
-  console.log(`QueueLess API running on port ${PORT}`);
-});
+/* =====================================================
+   SHUTDOWN
+===================================================== */
+
+process.on(
+  "SIGTERM",
+  () => {
+    db.close(() => {
+      process.exit(0);
+    });
+  }
+);
+
+process.on(
+  "SIGINT",
+  () => {
+    db.close(() => {
+      process.exit(0);
+    });
+  }
+);
