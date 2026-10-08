@@ -1,61 +1,61 @@
 const express = require('express');
 const cors = require('cors');
-// const twilio = require('twilio'); // Uncomment after setting up Twilio
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Replace these with your actual Twilio credentials
-// const client = twilio('YOUR_TWILIO_ACCOUNT_SID', 'YOUR_TWILIO_AUTH_TOKEN');
-
-// Temporary in-memory storage for OTPs (Use a real database like MongoDB for production)
+// Temporary "Databases"
 const otpStorage = {};
+const ticketStorage = {}; // Stores users' active tickets
 
-// Route 1: Generate and Send OTP
-app.post('/send-otp', async (req, res) => {
+// 1. Send OTP (Demo version - hardcoded to 1234)
+app.post('/send-otp', (req, res) => {
     const { phone } = req.body;
-
-    if (!phone) {
-        return res.status(400).json({ error: 'Phone number is required.' });
-    }
-
-    // Generate a 4-digit OTP
-    const otpCode = Math.floor(1000 + Math.random() * 9000).toString();
-    otpStorage[phone] = otpCode;
-
-    try {
-        /* TO SEND REAL SMS, UNCOMMENT THIS TWILIO BLOCK:
-        await client.messages.create({
-            body: `Your QueueLess login code is: ${otpCode}`,
-            from: '+1234567890', // Your Twilio Phone Number
-            to: phone
-        });
-        */
-        
-        console.log(`[DEBUG] OTP for ${phone} is ${otpCode}`);
-        res.status(200).json({ success: true, message: 'OTP sent successfully.' });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Failed to send SMS.' });
-    }
+    if (!phone) return res.status(400).json({ error: 'Phone number required' });
+    
+    // For demo purposes, we will accept '1234' as the code
+    otpStorage[phone] = '1234'; 
+    console.log(`[DEBUG] OTP for ${phone} is 1234`);
+    res.status(200).json({ success: true, message: 'OTP sent' });
 });
 
-// Route 2: Verify the OTP
+// 2. Verify OTP
 app.post('/verify-otp', (req, res) => {
     const { phone, code } = req.body;
-
     if (otpStorage[phone] && otpStorage[phone] === code) {
-        // Clear the OTP after successful use
         delete otpStorage[phone];
-        res.status(200).json({ success: true, message: 'Login successful.' });
+        res.status(200).json({ success: true });
     } else {
-        // Render 400 Bad Request for incorrect codes
-        res.status(400).json({ error: 'Invalid or expired OTP.' });
+        res.status(400).json({ error: 'Invalid OTP' });
     }
 });
 
-// Start the server (Render defaults to port 10000)
+// 3. Save Ticket to Database
+app.post('/save-token', (req, res) => {
+    const { phone, tokenData } = req.body;
+    if (!phone) return res.status(400).json({ error: 'Phone required' });
+    
+    ticketStorage[phone] = tokenData; // Save ticket
+    res.status(200).json({ success: true });
+});
+
+// 4. Retrieve Ticket from Database
+app.post('/get-token', (req, res) => {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: 'Phone required' });
+    
+    // Send ticket back to the browser if it exists
+    res.status(200).json({ success: true, tokenData: ticketStorage[phone] || null });
+});
+
+// 5. Delete Ticket from Database
+app.post('/cancel-token', (req, res) => {
+    const { phone } = req.body;
+    if (phone) delete ticketStorage[phone];
+    res.status(200).json({ success: true });
+});
+
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log(`Backend server running on port ${PORT}`);
